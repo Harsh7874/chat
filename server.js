@@ -19,19 +19,21 @@ app.use(cors());
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
-
+ 
 // ====== DB ======
 await mongoose.connect(MONGO_URL);
 console.log("Connected to MongoDB");
 
 // Message Schema
 const MessageSchema = new mongoose.Schema({
-  conversationId: { type: String, index: true }, // 👈 important
+  conversationId: { type: String, index: true },
   from: String,
   to: String,
   text: String,
+  status: { type: String, enum: ["sent", "delivered", "read"], default: "sent" },
   createdAt: { type: Date, default: Date.now }
 });
+
 
 // Compound index for fast pagination
 MessageSchema.index({ conversationId: 1, _id: -1 });
@@ -116,6 +118,27 @@ io.on("connection", (socket) => {
     console.log("Registered:", memberstackId);
   });
 
+
+  socket.on("mark_as_read", async ({ from, to }) => {
+  const users = [from, to].sort();
+  const conversationId = `${users[0]}_${users[1]}`;
+
+  // Update all delivered messages to read
+  const result = await Message.updateMany(
+    { conversationId, to, status: "delivered" },
+    { $set: { status: "read" } }
+  );
+
+  // Notify sender
+  const senderSocketId = onlineUsers.get(from);
+  if (senderSocketId) {
+    io.to(senderSocketId).emit("messages_read", {
+      conversationId
+    });
+  }
+});
+
+
   socket.on("send_message", async (data) => {
     try {
       const { from, to, text } = data;
@@ -128,6 +151,7 @@ const msg = {
   from,
   to,
   text,
+  status: "sent",
   createdAt: new Date()
 };
 
@@ -159,8 +183,23 @@ redisSub.on("message", (channel, message) => {
   const msg = JSON.parse(message);
   const receiverSocketId = onlineUsers.get(msg.to);
 
-  if (receiverSocketId) {
+  if (receiverSocketId)  {
     io.to(receiverSocketId).emit("new_message", msg);
+    // Mark as delivered in DB
+ Message.updateOne(
+  { _id: msg._id },
+  { $set: { status: "delivered" } }
+).then(()=>{console.log()}).catch();
+
+// Notify sender that message is delivered
+const senderSocketId = onlineUsers.get(msg.from);
+if (senderSocketId) {
+  io.to(senderSocketId).emit("message_status_update", {
+    messageId: msg._id,
+    status: "delivered"
+  });
+}
+
   }
 });
 
@@ -201,7 +240,7 @@ app.get("/messages", async (req, res) => {
   // Cursor pagination: load messages older than this _id
   if (before) {
     query._id = { $lt: before };
-  }
+  }  
   let messages = await Message.find(query)
     .sort({ _id: -1 })     // newest first (selects the correct batch)
     .limit(Number(limit));
