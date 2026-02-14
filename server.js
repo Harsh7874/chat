@@ -26,11 +26,16 @@ console.log("Connected to MongoDB");
 
 // Message Schema
 const MessageSchema = new mongoose.Schema({
+  conversationId: { type: String, index: true }, // 👈 important
   from: String,
   to: String,
   text: String,
   createdAt: { type: Date, default: Date.now }
 });
+
+// Compound index for fast pagination
+MessageSchema.index({ conversationId: 1, _id: -1 });
+
 const Message = mongoose.model("Message", MessageSchema);
 
 // ====== REDIS CLIENTS ======
@@ -42,6 +47,64 @@ console.log("Connected to Redis");
 
 // ====== ONLINE USERS MAP ======
 const onlineUsers = new Map(); // memberstackId -> socketId
+app.get("/chats/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  const chats = await Message.aggregate([
+    {
+      $match: {
+        $or: [{ from: userId }, { to: userId }]
+      }
+    },
+    {
+      $project: {
+        otherUser: {
+          $cond: [
+            { $eq: ["$from", userId] },
+            "$to",
+            "$from"
+          ]
+        },
+        createdAt: 1
+      }
+    },
+    { $sort: { createdAt: -1 } },
+    {
+      $group: {
+        _id: "$otherUser",
+        lastMessageAt: { $first: "$createdAt" }
+      }
+    },
+    { $sort: { lastMessageAt: -1 } }
+  ]);
+
+  res.json(chats.map(c => ({ userId: c._id })));
+});
+app.delete("/chats", async (req, res) => {
+  const { user1, user2 } = req.query;
+
+  if (!user1 || !user2) {
+    return res.status(400).json({ error: "user1 and user2 required" });
+  }
+
+  await Message.deleteMany({
+    $or: [
+      { from: user1, to: user2 },
+      { from: user2, to: user1 }
+    ]
+  });
+
+  res.json({ success: true });
+});
+app.delete("/chats/all/:userId", async (req, res) => {
+  const { userId } = req.params;
+
+  await Message.deleteMany({
+    $or: [{ from: userId }, { to: userId }]
+  });
+
+  res.json({ success: true });
+});
 
 // ====== SOCKET LOGIC ======
 io.on("connection", (socket) => {
@@ -57,12 +120,17 @@ io.on("connection", (socket) => {
     try {
       const { from, to, text } = data;
 
-      const msg = {
-        from,
-        to,
-        text,
-        createdAt: new Date()
-      };
+    const users = [from, to].sort(); // stable order
+const conversationId = `${users[0]}_${users[1]}`;
+
+const msg = {
+  conversationId,
+  from,
+  to,
+  text,
+  createdAt: new Date()
+};
+
 
       // 1) Publish to Redis for instant delivery
       await redisPub.publish("chat", JSON.stringify(msg));
@@ -123,21 +191,29 @@ app.get("/", (req, res) => {
 
 
 app.get("/messages", async (req, res) => {
-  const { user1, user2 } = req.query;
+  const { user1, user2, before, limit = 50 } = req.query;
 
   if (!user1 || !user2) {
     return res.status(400).json({ error: "user1 and user2 are required" });
   }
 
-  const messages = await Message.find({
-    $or: [
-      { from: user1, to: user2 },
-      { from: user2, to: user1 }
-    ]
-  }).sort({ createdAt: 1 });
+  const users = [user1, user2].sort();
+  const conversationId = `${users[0]}_${users[1]}`;
+
+  const query = { conversationId };
+
+  // Cursor pagination: load messages older than this _id
+  if (before) {
+    query._id = { $lt: before };
+  }
+
+  const messages = await Message.find(query)
+    .sort({ _id: 1 })     // newest first
+    .limit(Number(limit));
 
   res.json(messages);
 });
+
 
 
 // ====== START SERVER ======
