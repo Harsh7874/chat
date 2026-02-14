@@ -96,6 +96,40 @@ io.on("connection", (socket) => {
     socket.memberstackId = memberstackId;
     console.log("Registered:", memberstackId);
   });
+  socket.on("chat_opened", async ({ from, to }) => {
+  try {
+    // Find messages sent from `from` to `to` that are not read yet
+    const msgs = await Message.find(
+      { from, to, status: { $ne: "read" } },
+      { _id: 1 }
+    );
+
+    if (msgs.length === 0) return;
+
+    const ids = msgs.map(m => m._id);
+
+    // 🚀 1) Notify sender IMMEDIATELY
+    const senderSocketId = onlineUsers.get(from);
+    if (senderSocketId) {
+      ids.forEach(id => {
+        io.to(senderSocketId).emit("status_update", {
+          messageId: id,
+          status: "read"
+        });
+      });
+    }
+
+    // 🗄️ 2) Update DB in background (don’t block UI)
+    Message.updateMany(
+      { _id: { $in: ids } },
+      { status: "read" }
+    ).catch(err => console.error("DB read update error:", err));
+
+  } catch (err) {
+    console.error("chat_opened error:", err);
+  }
+});
+
   socket.on("send_message", async (data) => {
     try {
       const { from, to, text, tempId } = data;
@@ -133,23 +167,7 @@ io.on("connection", (socket) => {
       console.error("Delivered error:", err);
     }
   });
-  socket.on("mark_as_read", async ({ from, to }) => {
-    try {
-      // Find unread messages
-      const unreadMsgs = await Message.find({ from, to, status: { $ne: "read" } }, { _id: 1 });
-      if (unreadMsgs.length === 0) return;
-      const ids = unreadMsgs.map(m => m._id);
-      await Message.updateMany({ _id: { $in: ids } }, { status: "read" });
-      const senderSocketId = onlineUsers.get(from);
-      if (senderSocketId) {
-        ids.forEach(id => {
-          io.to(senderSocketId).emit("status_update", { messageId: id, status: "read" });
-        });
-      }
-    } catch (err) {
-      console.error("Mark as read error:", err);
-    }
-  });
+  
   socket.on("disconnect", () => {
     if (socket.memberstackId) {
       onlineUsers.delete(socket.memberstackId);
