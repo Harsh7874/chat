@@ -192,25 +192,20 @@ app.get("/", (req, res) => {
 
 app.get("/messages", async (req, res) => {
   const { user1, user2, before, limit = 50 } = req.query;
-
   if (!user1 || !user2) {
     return res.status(400).json({ error: "user1 and user2 are required" });
   }
-
   const users = [user1, user2].sort();
   const conversationId = `${users[0]}_${users[1]}`;
-
   const query = { conversationId };
-
   // Cursor pagination: load messages older than this _id
   if (before) {
     query._id = { $lt: before };
   }
-
-  const messages = await Message.find(query)
-    .sort({ _id: 1 })     // newest first
+  let messages = await Message.find(query)
+    .sort({ _id: -1 })     // newest first (selects the correct batch)
     .limit(Number(limit));
-
+  messages = messages.reverse(); // reverse to oldest-to-newest order in array
   res.json(messages);
 });
 
